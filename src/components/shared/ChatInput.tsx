@@ -6,18 +6,20 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  getSettings,
+  saveSettingsWithSync,
+  type ConversationMode,
+} from '@/shared/db/settings';
 import type { MessageAttachment } from '@/shared/hooks/useAgent';
 import { cn } from '@/shared/lib/utils';
 import { useLanguage } from '@/shared/providers/language-provider';
 import {
   ArrowUp,
-  Cpu,
   FileText,
-  MessageCircle,
   Paperclip,
   Plus,
   Send,
-  Sparkles,
   Square,
   X,
 } from 'lucide-react';
@@ -26,14 +28,13 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 
-export type ChatMode = 'auto' | 'chat' | 'task';
+import { AgentModeSelector } from './AgentModeSelector';
+import { ModelSelector } from './ModelSelector';
+
+export type ChatMode = ConversationMode;
 
 // Attachment type for files and images
 export interface Attachment {
@@ -43,7 +44,6 @@ export interface Attachment {
   preview?: string; // Data URL for image preview
   nativePath?: string; // Native file path from Tauri drag-drop
 }
-
 export interface CategoryTag {
   icon: React.ReactNode;
   label: string;
@@ -56,7 +56,11 @@ export interface ChatInputProps {
   /** Whether the agent is running */
   isRunning?: boolean;
   /** Callback when submitting with text, attachments, and mode */
-  onSubmit: (text: string, attachments?: MessageAttachment[], mode?: ChatMode) => Promise<void>;
+  onSubmit: (
+    text: string,
+    attachments?: MessageAttachment[],
+    mode?: ChatMode
+  ) => Promise<void>;
   /** Callback when stop button is clicked */
   onStop?: () => void;
   /** Variant: 'home' for larger home page style, 'reply' for compact reply style */
@@ -126,11 +130,28 @@ export function ChatInput({
   externalValue,
   onExternalValueConsumed,
   categoryTag,
-  defaultMode = 'auto',
+  defaultMode,
 }: ChatInputProps) {
   const { t } = useLanguage();
   const [value, setValue] = useState('');
-  const [chatMode, setChatMode] = useState<ChatMode>(defaultMode);
+  const [chatMode, setChatMode] = useState<ChatMode>(() => {
+    const settings = getSettings();
+    const preferred = defaultMode || settings.lastChatMode;
+    if (preferred === 'chat') return preferred;
+    if (
+      preferred?.startsWith('agent:') &&
+      settings.agentRuntimes.some(
+        (runtime) => runtime.id === preferred.slice(6) && runtime.enabled
+      )
+    ) {
+      return preferred;
+    }
+    const fallback = settings.agentRuntimes.find(
+      (runtime) =>
+        runtime.id === settings.defaultAgentRuntime && runtime.enabled
+    );
+    return fallback ? `agent:${fallback.id}` : 'chat';
+  });
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -138,6 +159,19 @@ export function ChatInput({
   const containerRef = useRef<HTMLDivElement>(null);
   const isComposingRef = useRef(false);
   const prevIsRunningRef = useRef(isRunning);
+
+  const selectChatMode = useCallback((mode: ChatMode) => {
+    setChatMode(mode);
+    const current = getSettings();
+    const next = {
+      ...current,
+      lastChatMode: mode,
+      defaultAgentRuntime: mode.startsWith('agent:')
+        ? mode.slice(6)
+        : current.defaultAgentRuntime,
+    };
+    void saveSettingsWithSync(next);
+  }, []);
 
   // Sync external value into the input
   useEffect(() => {
@@ -261,19 +295,32 @@ export function ChatInput({
 
       const newAttachments: Attachment[] = [];
       for (const filePath of paths) {
-        const name = filePath.split('/').pop() || filePath.split('\\').pop() || filePath;
+        const name =
+          filePath.split('/').pop() || filePath.split('\\').pop() || filePath;
         const ext = name.split('.').pop()?.toLowerCase() || '';
-        const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico'];
+        const imageExts = [
+          'jpg',
+          'jpeg',
+          'png',
+          'gif',
+          'webp',
+          'bmp',
+          'svg',
+          'ico',
+        ];
         const isImage = imageExts.includes(ext);
 
         // Create a minimal File object with the path stored in name
         // The actual content will be read later via Tauri FS when converting to MessageAttachment
         const mimeType = isImage
           ? `image/${ext === 'jpg' ? 'jpeg' : ext}`
-          : ext === 'pdf' ? 'application/pdf'
-          : ext === 'json' ? 'application/json'
-          : ext === 'csv' ? 'text/csv'
-          : 'application/octet-stream';
+          : ext === 'pdf'
+            ? 'application/pdf'
+            : ext === 'json'
+              ? 'application/json'
+              : ext === 'csv'
+                ? 'text/csv'
+                : 'application/octet-stream';
 
         const attachment: Attachment = {
           id: generateId(),
@@ -325,7 +372,8 @@ export function ChatInput({
 
     const setupDragDrop = async () => {
       // Only in Tauri environment
-      if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return;
+      if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window))
+        return;
 
       try {
         const { getCurrentWebview } = await import('@tauri-apps/api/webview');
@@ -343,18 +391,26 @@ export function ChatInput({
           } else if (event.payload.type === 'over') {
             const { x, y } = event.payload.position;
             const isOver =
-              x >= rect.left && x <= rect.right &&
-              y >= rect.top && y <= rect.bottom;
+              x >= rect.left &&
+              x <= rect.right &&
+              y >= rect.top &&
+              y <= rect.bottom;
             setIsDragging(isOver);
           } else if (event.payload.type === 'drop') {
             setIsDragging(false);
             const now = Date.now();
             const { x, y } = event.payload.position;
             const isOver =
-              x >= rect.left && x <= rect.right &&
-              y >= rect.top && y <= rect.bottom;
+              x >= rect.left &&
+              x <= rect.right &&
+              y >= rect.top &&
+              y <= rect.bottom;
             // Guard: only one ChatInput instance handles each drop
-            if (isOver && event.payload.paths.length > 0 && now - lastDropTimestamp > 100) {
+            if (
+              isOver &&
+              event.payload.paths.length > 0 &&
+              now - lastDropTimestamp > 100
+            ) {
               lastDropTimestamp = now;
               addFilesFromPaths(event.payload.paths);
             }
@@ -368,7 +424,9 @@ export function ChatInput({
     };
 
     setupDragDrop();
-    return () => { unlisten?.(); };
+    return () => {
+      unlisten?.();
+    };
   }, [addFilesFromPaths]);
 
   // Open file picker
@@ -387,7 +445,9 @@ export function ChatInput({
   };
 
   // Convert attachments to MessageAttachment format
-  const convertToMessageAttachments = async (): Promise<MessageAttachment[] | undefined> => {
+  const convertToMessageAttachments = async (): Promise<
+    MessageAttachment[] | undefined
+  > => {
     if (attachments.length === 0) return undefined;
 
     const result: MessageAttachment[] = [];
@@ -396,7 +456,9 @@ export function ChatInput({
       // For images, only include if preview exists and has data
       if (a.type === 'image') {
         if (!a.preview || a.preview.length === 0) {
-          console.warn(`[ChatInput] Skipping image ${a.file.name}: no preview data`);
+          console.warn(
+            `[ChatInput] Skipping image ${a.file.name}: no preview data`
+          );
           continue;
         }
       }
@@ -412,9 +474,14 @@ export function ChatInput({
       if (a.type === 'file' && !data) {
         try {
           data = await readFileAsBase64(a.file);
-          console.log(`[ChatInput] Read file ${a.file.name}: ${data.length} chars`);
+          console.log(
+            `[ChatInput] Read file ${a.file.name}: ${data.length} chars`
+          );
         } catch (error) {
-          console.error(`[ChatInput] Failed to read file ${a.file.name}:`, error);
+          console.error(
+            `[ChatInput] Failed to read file ${a.file.name}:`,
+            error
+          );
         }
       }
 
@@ -478,8 +545,8 @@ export function ChatInput({
     textarea.style.height = 'auto';
 
     // Calculate the new height
-    const maxHeight = isHome ? 200 : 120; // Max height in pixels
-    const minHeight = isHome ? 56 : 20; // Min height in pixels (home: taller default)
+    const maxHeight = isHome ? 200 : 140;
+    const minHeight = isHome ? 56 : 40;
     const newHeight = Math.min(
       Math.max(textarea.scrollHeight, minHeight),
       maxHeight
@@ -499,7 +566,7 @@ export function ChatInput({
         'relative w-full transition-colors',
         isHome
           ? 'border-border/50 bg-background rounded-2xl border p-4 shadow-lg'
-          : 'border-border/60 bg-background rounded-xl border p-3 shadow-sm',
+          : 'border-border/60 bg-background rounded-2xl border p-3 shadow-sm',
         isDragging && 'border-primary/50 bg-primary/5 border-2',
         className
       )}
@@ -572,8 +639,8 @@ export function ChatInput({
           isHome ? 'text-base' : 'px-1 text-sm'
         )}
         style={{
-          minHeight: isHome ? '56px' : '20px',
-          maxHeight: isHome ? '200px' : '120px',
+          minHeight: isHome ? '56px' : '40px',
+          maxHeight: isHome ? '200px' : '140px',
           overflowY: 'hidden',
         }}
         rows={1}
@@ -581,12 +648,7 @@ export function ChatInput({
       />
 
       {/* Bottom Actions */}
-      <div
-        className={cn(
-          'flex items-center justify-between',
-          isHome ? 'mt-3' : 'mt-2'
-        )}
-      >
+      <div className="mt-2.5 flex items-center justify-between">
         {/* Add Button + Category Tag */}
         <div className="flex items-center gap-2">
           <DropdownMenu modal={false}>
@@ -616,57 +678,12 @@ export function ChatInput({
             </DropdownMenuContent>
           </DropdownMenu>
 
-          {/* Mode Selector */}
-          <DropdownMenu modal={false}>
-            <DropdownMenuTrigger
-              disabled={isRunning || disabled}
-              className={cn(
-                'flex shrink-0 items-center gap-1 rounded-full border transition-colors focus:outline-none disabled:cursor-not-allowed disabled:opacity-50',
-                'border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground',
-                isHome ? 'h-8 px-2.5 text-xs' : 'h-7 px-2 text-xs'
-              )}
-            >
-              {chatMode === 'auto' && <Sparkles className="size-3.5" />}
-              {chatMode === 'chat' && <MessageCircle className="size-3.5" />}
-              {chatMode === 'task' && <Cpu className="size-3.5" />}
-              <span>
-                {chatMode === 'auto' && t.home.modeAuto}
-                {chatMode === 'chat' && t.home.modeChat}
-                {chatMode === 'task' && t.home.modeTask}
-              </span>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent
-              align="start"
-              sideOffset={8}
-              className="z-50 w-48"
-            >
-              <DropdownMenuLabel>{t.home.modeLabel}</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              <DropdownMenuRadioGroup
-                value={chatMode}
-                onValueChange={(v) => setChatMode(v as ChatMode)}
-              >
-                <DropdownMenuRadioItem value="auto" className="cursor-pointer">
-                  <div className="flex items-center gap-1.5">
-                    <Sparkles className="size-3.5" />
-                    <span>{t.home.modeAuto}</span>
-                  </div>
-                </DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="chat" className="cursor-pointer">
-                  <div className="flex items-center gap-1.5">
-                    <MessageCircle className="size-3.5" />
-                    <span>{t.home.modeChat}</span>
-                  </div>
-                </DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="task" className="cursor-pointer">
-                  <div className="flex items-center gap-1.5">
-                    <Cpu className="size-3.5" />
-                    <span>{t.home.modeTask}</span>
-                  </div>
-                </DropdownMenuRadioItem>
-              </DropdownMenuRadioGroup>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <AgentModeSelector
+            value={chatMode}
+            onValueChange={selectChatMode}
+            disabled={isRunning || disabled}
+            compact={!isHome}
+          />
 
           {/* Category Tag */}
           {categoryTag && (
@@ -689,8 +706,9 @@ export function ChatInput({
           )}
         </div>
 
-        {/* Submit/Stop Button */}
-        <div className="flex items-center gap-1">
+        {/* Model selector + Submit/Stop Button */}
+        <div className="flex min-w-0 items-center gap-2">
+          <ModelSelector disabled={isRunning || disabled} compact={!isHome} />
           {isRunning ? (
             <button
               type="button"

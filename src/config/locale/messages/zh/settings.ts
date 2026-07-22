@@ -6,6 +6,7 @@ export default {
   general: '通用',
   workplace: '工作区',
   model: '模型',
+  agent: '智能体',
   provider: '供应商',
   mcp: 'MCP',
   connector: '连接器',

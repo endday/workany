@@ -26,7 +26,6 @@ import { cn } from '@/shared/lib/utils';
 import { useLanguage } from '@/shared/providers/language-provider';
 import {
   ArrowDown,
-  CheckCircle2,
   ChevronDown,
   FileText,
   PanelLeft,
@@ -41,13 +40,6 @@ import {
   type Artifact,
 } from '@/components/artifacts';
 import { Logo } from '@/components/common/logo';
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
 import { LeftSidebar, SidebarProvider, useSidebar } from '@/components/layout';
 import { SettingsModal } from '@/components/settings';
 import { ChatInput, type ChatMode } from '@/components/shared/ChatInput';
@@ -56,6 +48,13 @@ import { PlanApproval } from '@/components/task/PlanApproval';
 import { QuestionInput } from '@/components/task/QuestionInput';
 import { RightSidebar } from '@/components/task/RightSidebar';
 import { ToolExecutionItem } from '@/components/task/ToolExecutionItem';
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 
 interface LocationState {
   prompt?: string;
@@ -120,6 +119,8 @@ function TaskDetailContent() {
     rejectPlan,
     pendingQuestion,
     respondToQuestion,
+    pendingPermission,
+    respondToPermission,
     sessionFolder,
     filesVersion,
     backgroundTasks,
@@ -266,7 +267,6 @@ function TaskDetailContent() {
   }, [stopPreview]);
 
   // Tool search
-  const [toolSearchQuery] = useState('');
 
   // Title rename dialog state
   const [renameDialogOpen, setRenameDialogOpen] = useState(false);
@@ -654,9 +654,15 @@ function TaskDetailContent() {
   useEffect(() => {
     if (generatedTitle && taskId) {
       // Update current task state
-      setTask((prev) => prev && prev.id === taskId ? { ...prev, prompt: generatedTitle } : prev);
+      setTask((prev) =>
+        prev && prev.id === taskId ? { ...prev, prompt: generatedTitle } : prev
+      );
       // Update sidebar task list
-      setAllTasks((prev) => prev.map((t) => t.id === taskId ? { ...t, prompt: generatedTitle } : t));
+      setAllTasks((prev) =>
+        prev.map((t) =>
+          t.id === taskId ? { ...t, prompt: generatedTitle } : t
+        )
+      );
     }
   }, [generatedTitle, taskId]);
 
@@ -780,7 +786,13 @@ function TaskDetailContent() {
         const sessionInfo = initialSessionId
           ? { sessionId: initialSessionId, taskIndex: initialTaskIndex }
           : undefined;
-        await runAgent(initialPrompt, taskId, sessionInfo, initialAttachments, initialMode);
+        await runAgent(
+          initialPrompt,
+          taskId,
+          sessionInfo,
+          initialAttachments,
+          initialMode
+        );
         const newTask = await loadTask(taskId);
         setTask(newTask);
       } else {
@@ -795,7 +807,11 @@ function TaskDetailContent() {
 
   // Handle reply submission from ChatInput
   const handleReply = useCallback(
-    async (text: string, messageAttachments?: MessageAttachment[], mode?: ChatMode) => {
+    async (
+      text: string,
+      messageAttachments?: MessageAttachment[],
+      mode?: ChatMode
+    ) => {
       if (
         (text.trim() ||
           (messageAttachments && messageAttachments.length > 0)) &&
@@ -960,7 +976,6 @@ function TaskDetailContent() {
                     <MessageList
                       messages={messages}
                       isRunning={isRunning}
-                      searchQuery={toolSearchQuery}
                       phase={phase}
                       onApprovePlan={approvePlan}
                       onRejectPlan={rejectPlan}
@@ -974,6 +989,43 @@ function TaskDetailContent() {
                         pendingQuestion={pendingQuestion}
                         onSubmit={respondToQuestion}
                       />
+                    )}
+
+                    {pendingPermission && (
+                      <div className="border-border bg-card mx-auto w-full max-w-xl rounded-xl border p-4 shadow-sm">
+                        <div className="text-foreground text-sm font-medium">
+                          {pendingPermission.tool}
+                        </div>
+                        <p className="text-muted-foreground mt-1 text-sm">
+                          {pendingPermission.description}
+                        </p>
+                        <div className="mt-4 flex justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void respondToPermission(
+                                pendingPermission.id,
+                                false
+                              )
+                            }
+                            className="border-input hover:bg-accent h-9 rounded-lg border px-3 text-sm font-medium"
+                          >
+                            Deny
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void respondToPermission(
+                                pendingPermission.id,
+                                true
+                              )
+                            }
+                            className="bg-foreground text-background hover:bg-foreground/90 h-9 rounded-lg px-3 text-sm font-medium"
+                          >
+                            Allow once
+                          </button>
+                        </div>
+                      </div>
                     )}
 
                     <div ref={messagesEndRef} />
@@ -1170,14 +1222,12 @@ function UserMessage({
 function MessageList({
   messages,
   isRunning,
-  searchQuery,
   phase,
   onApprovePlan,
   onRejectPlan,
 }: {
   messages: AgentMessage[];
   isRunning: boolean;
-  searchQuery?: string;
   phase?: string;
   onApprovePlan?: () => void;
   onRejectPlan?: () => void;
@@ -1249,18 +1299,25 @@ function MessageList({
     }
   }
 
-  // Collect all tool_result messages in order for matching with tool_use
+  // Prefer the protocol call id when pairing results. The ordered list is only
+  // a compatibility fallback for older persisted sessions without ids.
   const toolResultMessages: AgentMessage[] = [];
+  const toolResultsById = new Map<string, AgentMessage>();
   mergedMessages.forEach((msg) => {
     if (msg.type === 'tool_result') {
       toolResultMessages.push(msg);
+      if (msg.toolUseId) {
+        toolResultsById.set(msg.toolUseId, msg);
+      }
     }
   });
 
-  // Match tool_use with tool_result by index (they come in pairs)
-  const getToolResult = (toolUseIndex: number): AgentMessage | undefined => {
-    return toolResultMessages[toolUseIndex];
-  };
+  const getToolResult = (
+    message: AgentMessage,
+    toolUseIndex: number
+  ): AgentMessage | undefined =>
+    (message.id ? toolResultsById.get(message.id) : undefined) ||
+    toolResultMessages[toolUseIndex];
 
   // Filter out duplicate plan messages - only keep the last one
   const lastPlanIdx = mergedMessages.reduce(
@@ -1365,8 +1422,7 @@ function MessageList({
         pendingTextMessage = null;
       }
       const group = ensureCurrentGroup();
-      // Find associated tool_result by index
-      const result = getToolResult(toolUseIndex);
+      const result = getToolResult(message, toolUseIndex);
       group.tools.push({ message, globalIndex: toolGlobalIndex++, result });
       toolUseIndex++;
     } else if (message.type === 'tool_result') {
@@ -1429,7 +1485,6 @@ function MessageList({
               tools={group.tools}
               isCompleted={group.isCompleted}
               isRunning={isRunning}
-              searchQuery={searchQuery}
             />
           );
         }
@@ -1454,7 +1509,6 @@ function TaskGroupComponent({
   tools,
   isCompleted,
   isRunning,
-  searchQuery,
 }: {
   title: string;
   description: string;
@@ -1465,7 +1519,6 @@ function TaskGroupComponent({
   }[];
   isCompleted: boolean;
   isRunning: boolean;
-  searchQuery?: string;
 }) {
   const { t } = useLanguage();
   // Default: collapsed when completed, expanded when running or in progress
@@ -1478,61 +1531,49 @@ function TaskGroupComponent({
     }
   }, [isCompleted, isRunning]);
 
+  const isActivelyRunning = isRunning && !isCompleted;
+
   return (
-    <div className="min-w-0 space-y-3">
-      {/* Task description with Logo */}
+    <div className="min-w-0">
       {description && (
-        <div className="flex min-w-0 flex-col gap-2">
-          <div className="flex min-w-0 items-start gap-2">
-            {isCompleted ? (
-              <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-500" />
-            ) : (
-              <div className="mt-0.5 flex size-4 shrink-0 items-center justify-center">
-                <div className="bg-primary size-2 animate-pulse rounded-full" />
-              </div>
-            )}
-            <span className="text-foreground line-clamp-2 min-w-0 text-sm font-medium break-words">
-              {title}
-            </span>
-          </div>
-        </div>
+        <p className="text-muted-foreground mb-2 line-clamp-2 min-w-0 text-[13px] leading-5 break-words">
+          {title}
+        </p>
       )}
 
-      {/* Collapsible tool list */}
       {tools.length > 0 && (
-        <div className="border-border/40 bg-accent/20 min-w-0 overflow-hidden rounded-xl border">
-          {/* Header */}
+        <div className="min-w-0">
           <button
+            type="button"
             onClick={() => setIsExpanded(!isExpanded)}
-            className="text-muted-foreground hover:text-foreground hover:bg-accent/30 flex w-full cursor-pointer items-center gap-2 px-4 py-2.5 text-sm transition-colors"
+            disabled={isActivelyRunning}
+            className="text-muted-foreground hover:text-foreground disabled:hover:text-muted-foreground inline-flex items-center gap-1.5 bg-transparent p-0 text-xs transition-colors disabled:cursor-default"
           >
             <ChevronDown
               className={cn(
-                'size-4 shrink-0 transition-transform',
+                'size-3 shrink-0 transition-transform',
                 !isExpanded && '-rotate-90'
               )}
             />
-            <span className="flex-1 text-left">
-              {isExpanded
-                ? t.task.hideSteps
-                : t.task.showSteps.replace('{count}', String(tools.length))}
+            <span>
+              {(isActivelyRunning
+                ? t.task.workingSteps
+                : t.task.workedSteps
+              ).replace('{count}', String(tools.length))}
             </span>
           </button>
 
-          {/* Tool list */}
           {isExpanded && (
-            <div className="px-2 pb-2">
-              {tools.map(({ message, globalIndex, result }, index) => (
+            <div className="mt-2 flex min-w-0 flex-col gap-1.5">
+              {tools.map(({ message, globalIndex, result }) => (
                 <ToolExecutionItem
                   key={globalIndex}
                   message={message}
                   result={result}
-                  isFirst={index === 0}
                   isLast={
                     globalIndex === tools[tools.length - 1].globalIndex &&
-                    isRunning
+                    isActivelyRunning
                   }
-                  searchQuery={searchQuery}
                 />
               ))}
             </div>
@@ -1595,7 +1636,7 @@ function MessageItem({
                 if (isInline) {
                   return (
                     <code
-                      className="bg-muted rounded px-1.5 py-0.5 text-sm"
+                      className="bg-muted/55 text-foreground/90 rounded-md px-1.5 py-0.5 font-mono text-[0.9em] font-medium before:content-none after:content-none"
                       {...props}
                     >
                       {children}
@@ -1631,21 +1672,23 @@ function MessageItem({
               ),
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               table: ({ children }: any) => (
-                <div className="overflow-x-auto">
-                  <table className="border-border border-collapse border">
+                <div className="border-border/70 my-4 overflow-x-auto rounded-xl border">
+                  <table className="my-0 w-full min-w-[36rem] border-separate border-spacing-0 text-sm [&_tr:last-child_td]:border-b-0">
                     {children}
                   </table>
                 </div>
               ),
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               th: ({ children }: any) => (
-                <th className="border-border bg-muted border px-3 py-2 text-left">
+                <th className="border-border/60 bg-muted/35 text-muted-foreground border-r border-b px-4 py-2.5 text-left text-xs font-medium tracking-wide last:border-r-0">
                   {children}
                 </th>
               ),
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
               td: ({ children }: any) => (
-                <td className="border-border border px-3 py-2">{children}</td>
+                <td className="border-border/50 border-r border-b px-4 py-3 align-top leading-6 last:border-r-0 [&_p]:m-0">
+                  {children}
+                </td>
               ),
             }}
           >
@@ -1786,7 +1829,9 @@ function ErrorMessage({ message }: { message: string }) {
     const errorMessage = (
       t.common.errors.customApiError ||
       'Custom API ({baseUrl}) may not be compatible with Claude Code SDK. Please check the API configuration or try a different provider. Log file: {logPath}'
-    ).replace('{baseUrl}', baseUrl).replace('{logPath}', logPath);
+    )
+      .replace('{baseUrl}', baseUrl)
+      .replace('{logPath}', logPath);
 
     return (
       <div className="flex items-start gap-3 py-2">

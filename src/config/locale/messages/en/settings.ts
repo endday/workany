@@ -6,6 +6,7 @@ export default {
   general: 'General',
   workplace: 'Workspace',
   model: 'Model',
+  agent: 'Agents',
   provider: 'Provider',
   mcp: 'MCP',
   connector: 'Connector',
@@ -33,7 +34,8 @@ export default {
   agentRuntime: 'Agent Runtime',
   agentRuntimeDescription: 'The AI agent that executes tasks',
   runtimeCodeAnyAgent: 'CodeAny Agent',
-  runtimeCodeAnyAgentDescription: 'Open-source in-process agent runtime, no CLI binary required',
+  runtimeCodeAnyAgentDescription:
+    'Open-source in-process agent runtime, no CLI binary required',
 
   // Code Environment
   codeEnvironment: 'Code Environment',

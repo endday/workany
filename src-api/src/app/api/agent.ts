@@ -11,7 +11,12 @@ import {
   runPlanningPhase,
 } from '@/shared/services/agent';
 import { generateTitle, runChat } from '@/shared/services/chat';
-import type { AgentRequest } from '@/shared/types/agent';
+import {
+  closeAcpRuntime,
+  promptAcpRuntime,
+  respondAcpPermission,
+} from '@/shared/services/acp';
+import type { AgentRequest, ModelConfig } from '@/shared/types/agent';
 
 const agent = new Hono();
 
@@ -66,6 +71,84 @@ agent.post('/chat', async (c) => {
   );
 
   return new Response(readable, { headers: SSE_HEADERS });
+});
+
+// External agent runtime over ACP (stdio transport).
+agent.post('/acp', async (c) => {
+  const body = await c.req.json<{
+    prompt?: string;
+    taskId?: string;
+    workDir?: string;
+    runtime?: { id?: string; name?: string; command?: string; args?: string };
+    modelConfig?: ModelConfig;
+  }>();
+  const key = body.taskId?.trim();
+  const prompt = body.prompt?.trim();
+  const runtime = body.runtime;
+  if (!key || !prompt || !runtime?.id || !runtime.command) {
+    return c.json({ error: 'taskId, prompt and ACP runtime are required' }, 400);
+  }
+  const resolvedRuntime = {
+    id: runtime.id,
+    name: runtime.name || runtime.id,
+    command: runtime.command,
+    args: runtime.args,
+    model: body.modelConfig?.model,
+    modelProvider: body.modelConfig?.apiKey ? 'workany' : body.modelConfig?.providerId,
+    apiKey: body.modelConfig?.apiKey,
+    baseUrl: body.modelConfig?.baseUrl,
+    apiType: body.modelConfig?.apiType,
+  };
+
+  const abortController = new AbortController();
+  const encoder = new TextEncoder();
+  const readable = new ReadableStream({
+    start(controller) {
+      void promptAcpRuntime({
+        key,
+        prompt,
+        cwd: body.workDir || process.cwd(),
+        runtime: resolvedRuntime,
+        signal: abortController.signal,
+        emit: (message) => {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(message)}\n\n`)
+          );
+        },
+      })
+        .catch((error) => {
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({
+                type: 'error',
+                message: error instanceof Error ? error.message : String(error),
+              })}\n\n`
+            )
+          );
+        })
+        .finally(() => controller.close());
+    },
+    cancel() {
+      abortController.abort();
+    },
+  });
+
+  return new Response(readable, { headers: SSE_HEADERS });
+});
+
+agent.post('/permission', async (c) => {
+  const body = await c.req.json<{
+    sessionId?: string;
+    permissionId?: string;
+    approved?: boolean;
+  }>();
+  const ok =
+    !!body.sessionId &&
+    !!body.permissionId &&
+    respondAcpPermission(body.sessionId, body.permissionId, !!body.approved);
+  return ok
+    ? c.json({ ok: true })
+    : c.json({ error: 'Permission request is no longer active' }, 404);
 });
 
 // Phase 1: Create a plan (no execution)
@@ -252,7 +335,8 @@ agent.post('/stop/:sessionId', async (c) => {
   const session = getSession(sessionId);
 
   if (!session) {
-    return c.json({ error: 'Session not found' }, 404);
+    closeAcpRuntime(sessionId);
+    return c.json({ status: 'stopped' });
   }
 
   deleteSession(sessionId);

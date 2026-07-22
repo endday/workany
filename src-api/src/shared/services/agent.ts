@@ -161,7 +161,7 @@ export function deletePlan(planId: string): boolean {
 export async function* runPlanningPhase(
   prompt: string,
   session: AgentSession,
-  modelConfig?: { apiKey?: string; baseUrl?: string; model?: string; apiType?: 'anthropic-messages' | 'openai-completions' },
+  modelConfig?: { apiKey?: string; baseUrl?: string; model?: string; apiType?: 'anthropic-messages' | 'openai-completions' | 'other' },
   language?: string
 ): AsyncGenerator<AgentMessage> {
   const agent = await getAgent(modelConfig as Partial<AgentConfig>);
@@ -188,7 +188,7 @@ export async function* runExecutionPhase(
   originalPrompt: string,
   workDir?: string,
   taskId?: string,
-  modelConfig?: { apiKey?: string; baseUrl?: string; model?: string; apiType?: 'anthropic-messages' | 'openai-completions' },
+  modelConfig?: { apiKey?: string; baseUrl?: string; model?: string; apiType?: 'anthropic-messages' | 'openai-completions' | 'other' },
   sandboxConfig?: SandboxConfig,
   skillsConfig?: SkillsConfig,
   mcpConfig?: McpConfig,
@@ -242,7 +242,7 @@ export async function* runAgent(
   conversation?: ConversationMessage[],
   workDir?: string,
   taskId?: string,
-  modelConfig?: { apiKey?: string; baseUrl?: string; model?: string; apiType?: 'anthropic-messages' | 'openai-completions' },
+  modelConfig?: { apiKey?: string; baseUrl?: string; model?: string; apiType?: 'anthropic-messages' | 'openai-completions' | 'other' },
   sandboxConfig?: SandboxConfig,
   images?: ImageAttachment[],
   skillsConfig?: SkillsConfig,

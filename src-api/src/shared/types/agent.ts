@@ -28,7 +28,8 @@ export interface ModelConfig {
   apiKey?: string; // API key
   baseUrl?: string; // Custom API base URL
   model?: string; // Model name to use
-  apiType?: 'anthropic-messages' | 'openai-completions'; // API format type
+  providerId?: string; // Provider identifier used to disambiguate ACP model IDs
+  apiType?: 'anthropic-messages' | 'openai-completions' | 'other'; // API format type
 }
 
 /**

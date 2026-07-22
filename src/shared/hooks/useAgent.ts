@@ -30,6 +30,23 @@ import { getAppDataDir, getFileName } from '@/shared/lib/paths';
 
 const AGENT_SERVER_URL = API_BASE_URL;
 
+export type AgentRunMode = 'chat' | `agent:${string}`;
+
+function getAcpRuntime(mode?: AgentRunMode) {
+  if (!mode?.startsWith('agent:')) return undefined;
+  const id = mode.slice(6);
+  const runtime = getSettings().agentRuntimes.find(
+    (item) => item.id === id && item.enabled && item.type === 'acp'
+  );
+  if (!runtime) return undefined;
+  return {
+    id: runtime.id,
+    name: runtime.name,
+    command: String(runtime.config.command || ''),
+    args: String(runtime.config.args || ''),
+  };
+}
+
 // Helper to get current language translations
 function getErrorMessages() {
   const settings = getSettings();
@@ -42,39 +59,6 @@ function getErrorMessages() {
 function getPreferredLanguage(): string | undefined {
   const lang = getSettings().language;
   return lang && lang.trim() !== '' ? lang : undefined;
-}
-
-/**
- * Detect if a prompt is a simple conversational query that can use the fast chat path.
- * Returns true for greetings, simple questions, etc.
- * Returns false for task-oriented prompts that need agent capabilities.
- */
-function isFastChatQuery(prompt: string): boolean {
-  const trimmed = prompt.trim();
-  // Long prompts are likely task descriptions
-  if (trimmed.length > 200) return false;
-  // URLs require agent mode for web access (curl, CDP, etc.)
-  if (/https?:\/\//.test(trimmed)) return false;
-  // Check for task-oriented keywords
-  const taskKeywords = [
-    // File operations
-    '创建', '生成', '写入', '删除', '修改', '编辑', '保存',
-    'create', 'generate', 'write', 'delete', 'modify', 'edit', 'save',
-    // Development
-    '开发', '构建', '部署', '编译', '运行', '安装',
-    'develop', 'build', 'deploy', 'compile', 'run', 'install',
-    // File paths
-    '文件', '文件夹', '目录', 'file', 'folder', 'directory', 'path',
-    // Code
-    '代码', '脚本', '函数', 'code', 'script', 'function',
-    // Analysis
-    '分析', '扫描', '搜索', '查找', 'analyze', 'scan', 'search', 'find',
-    // Web
-    '网站', '网页', '爬取', '联网', '访问', '打开', '下载',
-    'website', 'webpage', 'scrape', 'fetch', 'browse', 'download', 'visit',
-  ];
-  const lower = trimmed.toLowerCase();
-  return !taskKeywords.some((kw) => lower.includes(kw));
 }
 
 console.log(
@@ -163,7 +147,13 @@ async function fetchWithRetry(
 
 // Helper to get model configuration from user settings
 function getModelConfig():
-  | { apiKey?: string; baseUrl?: string; model?: string; apiType?: string }
+  | {
+      apiKey?: string;
+      baseUrl?: string;
+      model?: string;
+      apiType?: string;
+      providerId?: string;
+    }
   | undefined {
   try {
     const settings = getSettings();
@@ -179,7 +169,15 @@ function getModelConfig():
 
     if (!provider) return undefined;
 
-    const config: { apiKey?: string; baseUrl?: string; model?: string; apiType?: string } = {};
+    const config: {
+      apiKey?: string;
+      baseUrl?: string;
+      model?: string;
+      apiType?: string;
+      providerId?: string;
+    } = {};
+
+    config.providerId = provider.id;
 
     if (provider.apiKey) {
       config.apiKey = provider.apiKey;
@@ -361,6 +359,7 @@ export interface AgentMessage {
     | 'plan'
     | 'direct_answer';
   content?: string;
+  isDelta?: boolean;
   name?: string;
   id?: string; // tool_use id
   input?: unknown;
@@ -432,14 +431,14 @@ export interface UseAgentReturn {
     existingTaskId?: string,
     sessionInfo?: SessionInfo,
     attachments?: MessageAttachment[],
-    mode?: 'auto' | 'chat' | 'task'
+    mode?: AgentRunMode
   ) => Promise<string>;
   approvePlan: () => Promise<void>;
   rejectPlan: () => void;
   continueConversation: (
     reply: string,
     attachments?: MessageAttachment[],
-    mode?: 'auto' | 'chat' | 'task'
+    mode?: AgentRunMode
   ) => Promise<void>;
   stopAgent: () => Promise<void>;
   clearMessages: () => void;
@@ -1082,7 +1081,9 @@ export function useAgent(): UseAgentReturn {
                   type: msg.type as AgentMessage['type'],
                   content: msg.content || undefined,
                   name: msg.tool_name || undefined,
-                  input: msg.tool_input ? JSON.parse(msg.tool_input) : undefined,
+                  input: msg.tool_input
+                    ? JSON.parse(msg.tool_input)
+                    : undefined,
                   output: msg.tool_output || undefined,
                   toolUseId: msg.tool_use_id || undefined,
                   subtype: msg.subtype as AgentMessage['subtype'],
@@ -1219,10 +1220,15 @@ export function useAgent(): UseAgentReturn {
             attachments,
           });
         } else if (msg.type === 'text') {
-          agentMessages.push({
-            type: 'text' as const,
-            content: msg.content || undefined,
-          });
+          const previous = agentMessages.at(-1);
+          if (previous?.type === 'text') {
+            previous.content = `${previous.content || ''}${msg.content || ''}`;
+          } else {
+            agentMessages.push({
+              type: 'text' as const,
+              content: msg.content || undefined,
+            });
+          }
         } else if (msg.type === 'tool_use') {
           agentMessages.push({
             type: 'tool_use' as const,
@@ -1299,7 +1305,11 @@ export function useAgent(): UseAgentReturn {
         const lastPlanMessage = [...agentMessages]
           .reverse()
           .find((m) => m.type === 'plan' && m.plan);
-        if (lastPlanMessage && lastPlanMessage.type === 'plan' && lastPlanMessage.plan) {
+        if (
+          lastPlanMessage &&
+          lastPlanMessage.type === 'plan' &&
+          lastPlanMessage.plan
+        ) {
           const planSteps = lastPlanMessage.plan.steps || [];
           // Check if plan has incomplete steps (pending or no status)
           const hasIncompleteSteps = planSteps.some(
@@ -1308,9 +1318,16 @@ export function useAgent(): UseAgentReturn {
 
           // Restore plan if task is not completed/stopped and has incomplete steps
           if (hasIncompleteSteps && !taskIsCompleted && !taskIsStopped) {
-            console.log('[useAgent] Restoring plan awaiting approval for task:', id, {
-              planSteps: planSteps.map((s) => ({ title: s.title, status: s.status })),
-            });
+            console.log(
+              '[useAgent] Restoring plan awaiting approval for task:',
+              id,
+              {
+                planSteps: planSteps.map((s) => ({
+                  title: s.title,
+                  status: s.status,
+                })),
+              }
+            );
             setPlan(lastPlanMessage.plan);
             setPhase('awaiting_approval');
           }
@@ -1398,6 +1415,22 @@ export function useAgent(): UseAgentReturn {
 
       const decoder = new TextDecoder();
       let buffer = '';
+      let pendingDeltaText = '';
+
+      const flushDeltaText = async () => {
+        if (!pendingDeltaText) return;
+        const content = pendingDeltaText;
+        pendingDeltaText = '';
+        try {
+          await createMessage({
+            task_id: currentTaskId,
+            type: 'text',
+            content,
+          });
+        } catch (dbError) {
+          console.error('Failed to save streamed text message:', dbError);
+        }
+      };
 
       // Track pending tool_use messages to match with tool_result
       const pendingToolUses: Map<
@@ -1437,6 +1470,7 @@ export function useAgent(): UseAgentReturn {
                   sessionIdRef.current = data.sessionId || null;
                 }
               } else if (data.type === 'done') {
+                await flushDeltaText();
                 // Update background task status (always, even if not active)
                 updateBackgroundTaskStatus(currentTaskId, false);
 
@@ -1456,15 +1490,37 @@ export function useAgent(): UseAgentReturn {
                   });
                 }
               } else if (data.type === 'permission_request') {
+                await flushDeltaText();
                 // Handle permission request - only for active task
                 if (isActive && data.permission) {
                   setPendingPermission(data.permission);
                   setMessages((prev) => [...prev, data]);
                 }
               } else {
+                if (data.type === 'text' && data.isDelta && data.content) {
+                  pendingDeltaText += data.content;
+                } else {
+                  await flushDeltaText();
+                }
+
                 // UI update only for active task
                 if (isActive) {
-                  setMessages((prev) => [...prev, data]);
+                  setMessages((prev) => {
+                    if (data.type !== 'text' || !data.isDelta) {
+                      return [...prev, data];
+                    }
+                    const last = prev.at(-1);
+                    if (last?.type === 'text' && last.isDelta) {
+                      return [
+                        ...prev.slice(0, -1),
+                        {
+                          ...last,
+                          content: `${last.content || ''}${data.content || ''}`,
+                        },
+                      ];
+                    }
+                    return [...prev, data];
+                  });
                 }
 
                 // Extract file paths from text messages
@@ -1582,6 +1638,7 @@ export function useAgent(): UseAgentReturn {
 
                 // Save message to database
                 try {
+                  if (data.type === 'text' && data.isDelta) continue;
                   await createMessage({
                     task_id: currentTaskId,
                     type: data.type as
@@ -1620,6 +1677,7 @@ export function useAgent(): UseAgentReturn {
           }
         }
       }
+      await flushDeltaText();
     },
     []
   );
@@ -1705,9 +1763,19 @@ export function useAgent(): UseAgentReturn {
             try {
               const modelConfig = getModelConfig();
               const language = getPreferredLanguage();
-              console.log('[useAgent] Requesting title generation for prompt:', prompt.slice(0, 80));
-              console.log('[useAgent] Title request URL:', `${AGENT_SERVER_URL}/agent/title`);
-              console.log('[useAgent] Title request payload:', { prompt: prompt.slice(0, 80), hasModelConfig: !!modelConfig, language });
+              console.log(
+                '[useAgent] Requesting title generation for prompt:',
+                prompt.slice(0, 80)
+              );
+              console.log(
+                '[useAgent] Title request URL:',
+                `${AGENT_SERVER_URL}/agent/title`
+              );
+              console.log('[useAgent] Title request payload:', {
+                prompt: prompt.slice(0, 80),
+                hasModelConfig: !!modelConfig,
+                language,
+              });
               const res = await fetch(`${AGENT_SERVER_URL}/agent/title`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1724,7 +1792,11 @@ export function useAgent(): UseAgentReturn {
                 }
               } else {
                 const errorText = await res.text();
-                console.error('[useAgent] Title generation failed:', res.status, errorText);
+                console.error(
+                  '[useAgent] Title generation failed:',
+                  res.status,
+                  errorText
+                );
               }
             } catch (err) {
               console.error('[useAgent] Failed to generate title:', err);
@@ -1751,7 +1823,8 @@ export function useAgent(): UseAgentReturn {
       const hasImages = images && images.length > 0;
 
       // Save file attachments to disk and augment prompt with file paths
-      const fileAttachments = attachments?.filter((a) => a.type === 'file') || [];
+      const fileAttachments =
+        attachments?.filter((a) => a.type === 'file') || [];
       let augmentedPrompt = prompt;
       let savedFileRefs: AttachmentReference[] = [];
 
@@ -1770,7 +1843,10 @@ export function useAgent(): UseAgentReturn {
         if (saveFolder) {
           try {
             savedFileRefs = await saveAttachments(saveFolder, fileAttachments);
-            console.log('[useAgent] Saved file attachments:', savedFileRefs.map((r) => r.path));
+            console.log(
+              '[useAgent] Saved file attachments:',
+              savedFileRefs.map((r) => r.path)
+            );
             setFilesVersion((v) => v + 1);
 
             // Append file paths to prompt so the agent knows about them
@@ -1781,19 +1857,29 @@ export function useAgent(): UseAgentReturn {
           }
         } else {
           // Can't save to disk — include file content inline for small text files
-          console.warn('[useAgent] No folder available, embedding file content in prompt');
-          const fileInfo = fileAttachments.map((a) => {
-            // For text-based files, decode and include content
-            if (a.data && (a.mimeType?.startsWith('text/') || a.name.match(/\.(csv|txt|json|xml|tsv|md|log)$/i))) {
-              try {
-                const content = atob(a.data.includes(',') ? a.data.split(',')[1] : a.data);
-                return `[File: ${a.name}]\n${content}`;
-              } catch {
-                return `[File: ${a.name}] (unable to decode)`;
+          console.warn(
+            '[useAgent] No folder available, embedding file content in prompt'
+          );
+          const fileInfo = fileAttachments
+            .map((a) => {
+              // For text-based files, decode and include content
+              if (
+                a.data &&
+                (a.mimeType?.startsWith('text/') ||
+                  a.name.match(/\.(csv|txt|json|xml|tsv|md|log)$/i))
+              ) {
+                try {
+                  const content = atob(
+                    a.data.includes(',') ? a.data.split(',')[1] : a.data
+                  );
+                  return `[File: ${a.name}]\n${content}`;
+                } catch {
+                  return `[File: ${a.name}] (unable to decode)`;
+                }
               }
-            }
-            return `[File: ${a.name}] (binary file, unable to include inline)`;
-          }).join('\n\n');
+              return `[File: ${a.name}] (binary file, unable to include inline)`;
+            })
+            .join('\n\n');
           augmentedPrompt = `${prompt}\n\n${fileInfo}`;
         }
       }
@@ -1809,7 +1895,10 @@ export function useAgent(): UseAgentReturn {
         console.log('[useAgent] Valid images for API:', images?.length || 0);
         console.log('[useAgent] File attachments:', fileAttachments.length);
         console.log('[useAgent] computedSessionFolder:', computedSessionFolder);
-        console.log('[useAgent] augmentedPrompt:', augmentedPrompt.slice(0, 200));
+        console.log(
+          '[useAgent] augmentedPrompt:',
+          augmentedPrompt.slice(0, 200)
+        );
       }
 
       try {
@@ -1820,20 +1909,14 @@ export function useAgent(): UseAgentReturn {
         // If Claude Code is available, it will use it even without explicit model configuration.
         // If Claude Code is not available and no model is configured, the backend will return an error.
 
-        // Fast chat detection: short text, no attachments, no file/code intent
-        // Only use fast chat for anthropic-messages providers (the chat service uses Anthropic SDK directly).
-        // OpenAI-format providers must go through the agent endpoint.
-        const hasFileAttachments = fileAttachments.length > 0;
-        const isAnthropicApi = !modelConfig?.apiType || modelConfig.apiType === 'anthropic-messages';
-        const shouldUseFastChat =
-          modelConfig &&
-          isAnthropicApi &&
-          !hasFileAttachments &&
-          (mode === 'chat' ||
-            (mode !== 'task' && !hasImages && isFastChatQuery(prompt)));
+        // Chat mode is always a direct model request: no agent runtime or tools.
+        const shouldUseFastChat = mode === 'chat';
 
         if (shouldUseFastChat) {
-          console.log('[useAgent] Using fast chat for simple query, mode:', mode);
+          console.log(
+            '[useAgent] Using fast chat for simple query, mode:',
+            mode
+          );
           setPhase('executing');
 
           const language = getPreferredLanguage();
@@ -1863,8 +1946,7 @@ export function useAgent(): UseAgentReturn {
           const decoder = new TextDecoder();
           let buffer = '';
           let fullContent = '';
-          const isActiveTask = () =>
-            activeTaskIdRef.current === currentTaskId;
+          const isActiveTask = () => activeTaskIdRef.current === currentTaskId;
 
           while (true) {
             const { done, value } = await reader.read();
@@ -1888,10 +1970,16 @@ export function useAgent(): UseAgentReturn {
                         if (last && last.type === 'text') {
                           return [
                             ...prev.slice(0, -1),
-                            { ...last, content: (last.content || '') + data.content },
+                            {
+                              ...last,
+                              content: (last.content || '') + data.content,
+                            },
                           ];
                         }
-                        return [...prev, { type: 'text', content: data.content }];
+                        return [
+                          ...prev,
+                          { type: 'text', content: data.content },
+                        ];
                       });
                     }
                   } else if (data.type === 'done') {
@@ -1919,7 +2007,8 @@ export function useAgent(): UseAgentReturn {
               task_id: currentTaskId,
               type: 'user',
               content: prompt,
-              attachments: allRefs.length > 0 ? JSON.stringify(allRefs) : undefined,
+              attachments:
+                allRefs.length > 0 ? JSON.stringify(allRefs) : undefined,
             });
             if (fullContent) {
               await createMessage({
@@ -1933,6 +2022,30 @@ export function useAgent(): UseAgentReturn {
             console.error('Failed to save fast chat response:', dbError);
           }
 
+          return currentTaskId;
+        }
+
+        const acpRuntime = getAcpRuntime(mode);
+        if (acpRuntime) {
+          setPhase('executing');
+          const workDir = computedSessionFolder || (await getAppDataDir());
+          const response = await fetchWithRetry(
+            `${AGENT_SERVER_URL}/agent/acp`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                prompt: augmentedPrompt,
+                taskId: currentTaskId,
+                workDir,
+                runtime: acpRuntime,
+                modelConfig,
+              }),
+              signal: abortController.signal,
+            }
+          );
+          if (!response.ok) throw new Error(`Server error: ${response.status}`);
+          await processStream(response, currentTaskId, abortController);
           return currentTaskId;
         }
 
@@ -1954,11 +2067,9 @@ export function useAgent(): UseAgentReturn {
           // file attachments were already saved earlier)
           try {
             const allRefs: AttachmentReference[] = [...savedFileRefs];
-            const imageAttachments = attachments?.filter((a) => a.type === 'image') || [];
-            if (
-              imageAttachments.length > 0 &&
-              computedSessionFolder
-            ) {
+            const imageAttachments =
+              attachments?.filter((a) => a.type === 'image') || [];
+            if (imageAttachments.length > 0 && computedSessionFolder) {
               const imageRefs = await saveAttachments(
                 computedSessionFolder,
                 imageAttachments
@@ -1973,7 +2084,8 @@ export function useAgent(): UseAgentReturn {
               task_id: currentTaskId,
               type: 'user',
               content: prompt,
-              attachments: allRefs.length > 0 ? JSON.stringify(allRefs) : undefined,
+              attachments:
+                allRefs.length > 0 ? JSON.stringify(allRefs) : undefined,
             });
           } catch (error) {
             console.error('Failed to save user message:', error);
@@ -2022,7 +2134,8 @@ export function useAgent(): UseAgentReturn {
             task_id: currentTaskId,
             type: 'user',
             content: prompt,
-            attachments: allRefs.length > 0 ? JSON.stringify(allRefs) : undefined,
+            attachments:
+              allRefs.length > 0 ? JSON.stringify(allRefs) : undefined,
           });
         } catch (error) {
           console.error('Failed to save user message:', error);
@@ -2419,7 +2532,11 @@ export function useAgent(): UseAgentReturn {
 
   // Continue conversation with context
   const continueConversation = useCallback(
-    async (reply: string, attachments?: MessageAttachment[], mode?: 'auto' | 'chat' | 'task'): Promise<void> => {
+    async (
+      reply: string,
+      attachments?: MessageAttachment[],
+      mode?: 'auto' | 'chat' | 'task'
+    ): Promise<void> => {
       if (isRunning || !taskId) return;
 
       // Add user message to UI immediately (with attachments if any)
@@ -2503,19 +2620,14 @@ export function useAgent(): UseAgentReturn {
           console.log('[useAgent] Valid images for API:', images?.length || 0);
         }
 
-        // Fast chat detection for follow-up messages
-        // Only use fast chat for anthropic-messages providers
-        const hasFileAttachments = attachments?.some((a) => a.type === 'file') || false;
-        const isAnthropicApi = !modelConfig?.apiType || modelConfig.apiType === 'anthropic-messages';
-        const shouldUseFastChat =
-          modelConfig &&
-          isAnthropicApi &&
-          !hasFileAttachments &&
-          (mode === 'chat' ||
-            (mode !== 'task' && !hasImages && isFastChatQuery(reply)));
+        // Chat mode remains a direct model request for follow-up messages.
+        const shouldUseFastChat = mode === 'chat';
 
         if (shouldUseFastChat) {
-          console.log('[useAgent] continueConversation: Using fast chat, mode:', mode);
+          console.log(
+            '[useAgent] continueConversation: Using fast chat, mode:',
+            mode
+          );
           setPhase('executing');
 
           const language = getPreferredLanguage();
@@ -2566,13 +2678,23 @@ export function useAgent(): UseAgentReturn {
                     if (isActiveTask()) {
                       setMessages((prev) => {
                         const last = prev[prev.length - 1];
-                        if (last && last.type === 'text' && last !== userMessage) {
+                        if (
+                          last &&
+                          last.type === 'text' &&
+                          last !== userMessage
+                        ) {
                           return [
                             ...prev.slice(0, -1),
-                            { ...last, content: (last.content || '') + data.content },
+                            {
+                              ...last,
+                              content: (last.content || '') + data.content,
+                            },
                           ];
                         }
-                        return [...prev, { type: 'text', content: data.content }];
+                        return [
+                          ...prev,
+                          { type: 'text', content: data.content },
+                        ];
                       });
                     }
                   } else if (data.type === 'done') {
@@ -2608,25 +2730,30 @@ export function useAgent(): UseAgentReturn {
           return;
         }
 
-        // Send conversation with full history (agent SDK path)
-        const response = await fetchWithRetry(`${AGENT_SERVER_URL}/agent`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            prompt: reply,
-            conversation: conversationHistory,
-            workDir,
-            taskId,
-            modelConfig,
-            sandboxConfig,
-            images: hasImages ? images : undefined,
-            skillsConfig,
-            mcpConfig,
-          }),
-          signal: abortController.signal,
-        });
+        // Send conversation through the selected agent runtime.
+        const acpRuntime = getAcpRuntime(mode);
+        const response = await fetchWithRetry(
+          `${AGENT_SERVER_URL}${acpRuntime ? '/agent/acp' : '/agent'}`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              prompt: reply,
+              conversation: conversationHistory,
+              workDir,
+              taskId,
+              modelConfig,
+              sandboxConfig,
+              images: hasImages ? images : undefined,
+              skillsConfig,
+              mcpConfig,
+              runtime: acpRuntime,
+            }),
+            signal: abortController.signal,
+          }
+        );
 
         if (!response.ok) {
           throw new Error(`Server error: ${response.status}`);

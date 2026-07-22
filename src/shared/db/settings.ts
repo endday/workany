@@ -8,7 +8,12 @@ import { API_BASE_URL } from '@/config';
 
 import { getAppDataDir, getMcpConfigPath } from '../lib/paths';
 
-export type ApiType = 'anthropic-messages' | 'openai-completions';
+export type ApiType = 'anthropic-messages' | 'openai-completions' | 'other';
+
+export interface AIProviderModel {
+  id: string;
+  displayName: string;
+}
 
 export interface AIProvider {
   id: string;
@@ -17,8 +22,10 @@ export interface AIProvider {
   baseUrl: string;
   enabled: boolean;
   models: string[];
+  modelEntries?: AIProviderModel[];
   defaultModel?: string;
   apiType?: ApiType;
+  providerType?: string;
   // Extended fields for UI
   icon?: string;
   apiKeyUrl?: string;
@@ -81,7 +88,8 @@ export const defaultSandboxProviders: SandboxProviderSetting[] = [
 // Agent Runtime Settings
 // ============================================================================
 
-export type AgentRuntimeType = 'codeany' | 'custom';
+export type AgentRuntimeType = 'codeany' | 'acp';
+export type ConversationMode = 'chat' | `agent:${string}`;
 
 export interface AgentRuntimeSetting {
   id: string;
@@ -93,6 +101,9 @@ export interface AgentRuntimeSetting {
     baseUrl?: string;
     model?: string;
     executablePath?: string;
+    command?: string;
+    args?: string;
+    protocol?: 'acp';
     [key: string]: unknown;
   };
 }
@@ -101,7 +112,7 @@ export const defaultAgentRuntimes: AgentRuntimeSetting[] = [
   {
     id: 'codeany',
     type: 'codeany',
-    name: 'CodeAny Agent',
+    name: 'WorkAny',
     enabled: true,
     config: {
       model: 'claude-sonnet-4-20250514',
@@ -219,6 +230,7 @@ export interface Settings {
   // Agent Runtime settings
   agentRuntimes: AgentRuntimeSetting[]; // Available agent runtimes
   defaultAgentRuntime: string; // Default agent runtime ID
+  lastChatMode: ConversationMode; // Last mode selected in the shared chat input
 
   // Conversation History settings
   maxConversationTurns: number; // Maximum conversation turns to keep in history (default: 20)
@@ -415,6 +427,7 @@ export const defaultSettings: Settings = {
   defaultSandboxProvider: 'codex', // Default to Codex sandbox, fallback to native
   agentRuntimes: defaultAgentRuntimes,
   defaultAgentRuntime: 'codeany', // Default to CodeAny Agent
+  lastChatMode: 'agent:codeany',
   maxConversationTurns: 20, // Default: 20 conversation turns
   maxHistoryTokens: 2000, // Default: 2000 tokens for history
   theme: 'system',
@@ -563,6 +576,14 @@ export async function getSettingsAsync(): Promise<Settings> {
   );
   settingsCache = defaultSettings;
   return defaultSettings;
+}
+
+// Re-read persisted settings instead of returning the in-memory cache.
+// Provider management uses this for the same explicit refresh interaction as
+// the server-backed grouter page.
+export async function reloadSettingsAsync(): Promise<Settings> {
+  settingsCache = null;
+  return getSettingsAsync();
 }
 
 // Get settings synchronously (returns cached or default)

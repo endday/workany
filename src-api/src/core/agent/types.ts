@@ -31,12 +31,14 @@ export type AgentMessageType =
   | 'error'
   | 'done'
   | 'plan'
-  | 'direct_answer';
+  | 'direct_answer'
+  | 'permission_request';
 
 export interface AgentMessage {
   type: AgentMessageType;
   sessionId?: string;
   content?: string;
+  isDelta?: boolean;
   name?: string;
   id?: string;
   input?: unknown;
@@ -50,6 +52,13 @@ export interface AgentMessage {
   plan?: TaskPlan;
   // Error fields
   message?: string;
+  permission?: {
+    id: string;
+    tool: string;
+    command?: string;
+    description: string;
+    risk_level?: 'low' | 'medium' | 'high';
+  };
 }
 
 export interface ConversationMessage {
@@ -101,7 +110,7 @@ export interface AgentConfig {
   /** Model to use (provider-specific) */
   model?: string;
   /** API type: 'anthropic-messages' or 'openai-completions' */
-  apiType?: 'anthropic-messages' | 'openai-completions';
+  apiType?: 'anthropic-messages' | 'openai-completions' | 'other';
   /** Working directory for file operations */
   workDir?: string;
   /** Custom configuration for the provider */

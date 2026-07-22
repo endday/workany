@@ -25,29 +25,18 @@ function isAnthropicModel(model: string): boolean {
   return model.startsWith('claude-') || model.includes('claude');
 }
 
-function resolveConfig(modelConfig?: { apiKey?: string; baseUrl?: string; model?: string }) {
+function resolveConfig(modelConfig?: {
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  apiType?: string;
+}) {
   // Use explicit modelConfig from user settings only — no environment variable fallback
   const apiKey = modelConfig?.apiKey || '';
   const baseURL = modelConfig?.baseUrl || undefined;
   const model = modelConfig?.model || DEFAULT_MODEL;
 
-  return { apiKey, baseURL, model };
-}
-
-function buildSystemPrompt(base: string, language?: string): string {
-  let systemPrompt = base;
-  if (language) {
-    const langMap: Record<string, string> = {
-      'zh-CN': 'Chinese (Simplified)',
-      'zh-TW': 'Chinese (Traditional)',
-      'en-US': 'English',
-      'ja-JP': 'Japanese',
-      'ko-KR': 'Korean',
-    };
-    const langName = langMap[language] || language;
-    systemPrompt += ` Please respond in ${langName}.`;
-  }
-  return systemPrompt;
+  return { apiKey, baseURL, model, apiType: modelConfig?.apiType };
 }
 
 // ============================================================================
@@ -197,12 +186,20 @@ async function openAICompatibleCreate(
  */
 export async function* runChat(
   prompt: string,
-  modelConfig?: { apiKey?: string; baseUrl?: string; model?: string },
-  language?: string,
+  modelConfig?: {
+    apiKey?: string;
+    baseUrl?: string;
+    model?: string;
+    apiType?: string;
+  },
+  _language?: string,
   conversation?: ConversationMessage[],
   abortController?: AbortController
 ): AsyncGenerator<AgentMessage> {
-  const { apiKey, baseURL, model } = resolveConfig(modelConfig);
+  const { apiKey, baseURL, model, apiType } = resolveConfig(modelConfig);
+  const useAnthropic = apiType
+    ? apiType === 'anthropic-messages'
+    : isAnthropicModel(model);
 
   if (!apiKey) {
     yield { type: 'error', message: 'No API key configured. Please set up your API key in Settings.' };
@@ -213,18 +210,15 @@ export async function* runChat(
   logger.info('[ChatService] Starting chat:', {
     model,
     hasBaseURL: !!baseURL,
-    isAnthropic: isAnthropicModel(model),
+    isAnthropic: useAnthropic,
     hasConversation: !!(conversation && conversation.length > 0),
     promptLength: prompt.length,
   });
 
-  const systemPrompt = buildSystemPrompt(
-    'You are a helpful assistant. Be concise and direct in your responses. ' +
-    'You have network access capabilities. When users ask about URLs, websites, or online content, ' +
-    'you should attempt to help by analyzing the URL structure, inferring content from the domain/path, ' +
-    'or suggesting the user switch to Agent/Task mode for full web access with tools like curl and browser automation.',
-    language
-  );
+  const systemPrompt = `You are the built-in chat assistant inside WorkAny, an AI workspace for conversations and agent-powered tasks.
+Be concise and practical. When the user asks about code, commands, or files, explain the next useful action clearly. Do not claim to have run tools, accessed the user's computer, or changed files unless the conversation explicitly contains those results.
+The conversation history may contain replies written by a different model or agent the user was talking to earlier. Treat those replies as context only—never adopt their identity, name, or model. Do not identify yourself as the underlying model provider or model. When asked who you are, you are WorkAny's built-in chat assistant, and you have no tool access.
+Always reply in the same language as the user's latest message. If the language cannot be determined reliably, reply in English.`;
 
   const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
   if (conversation && conversation.length > 0) {
@@ -244,7 +238,7 @@ export async function* runChat(
   messages.push({ role: 'user', content: prompt });
 
   // Non-Anthropic models: use OpenAI-compatible API
-  if (!isAnthropicModel(model)) {
+  if (!useAnthropic) {
     try {
       yield* runOpenAICompatibleChat(messages, systemPrompt, apiKey, baseURL, model, abortController);
     } catch (error) {
@@ -352,15 +346,13 @@ export async function generateTitle(
     } else {
       // Anthropic: native SDK
       const client = new Anthropic({ apiKey, baseURL });
-      const requestParams: Record<string, unknown> = {
+      const response = await client.messages.create({
         model,
         max_tokens: 50,
         system: systemPrompt,
         messages: [{ role: 'user', content: prompt }],
         thinking: { type: 'disabled' },
-      };
-
-      const response = await (client.messages.create as Function)(requestParams);
+      });
       title = (response.content as Array<{ type: string; text?: string }>)
         .filter((block) => block.type === 'text')
         .map((block) => block.text || '')
